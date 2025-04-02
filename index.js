@@ -1,24 +1,142 @@
-const _ = require('lodash');
-const atob = require('atob');
-const fs = require('fs');
-const inquirer = require('inquirer');
-const path = require('path');
-const ora = require('ora');
+import _ from 'lodash';
+import { promises as fs } from 'fs';
+import inquirer from 'inquirer';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+import ora from 'ora';
 
-const AuthFetcher = require('./lib/googleAPIWrapper');
-const FileHelper = require('./lib/fileHelper');
-const { time } = require('console');
+import googleAPI from './lib/googleAPIWrapper.js';
+import FileHelper from './lib/fileHelper.js';
+
+// Get __dirname equivalent in ES modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
 let pageCounter = 1;
-
 let messageIds = [];
 let gmail;
-String.prototype.replaceAll = function (search, replacement) {
-  var target = this;
-  return target.split(search).join(replacement);
+
+const spinner = ora('Processing...');
+
+// Remove prototype modification and use a proper function
+const replaceAll = (str, search, replacement) => str.split(search).join(replacement);
+
+async function main() {
+  try {
+    const { auth, gmail: gmailInstance } = await googleAPI.getAuthAndGmail();
+    gmail = gmailInstance; // Set the global gmail instance
+    const coredata = {};
+
+    spinner.start('Initializing...');
+
+    const workflow = process.argv.length > 2 ? scanForLabelOption : defaultBehaviour;
+    const mailList = await workflow(auth, gmail, coredata);
+
+    spinner.text = 'Fetching mail contents...';
+    const mails = await fetchMailsByMailIds(auth, mailList);
+
+    const attachments = pluckAllAttachments(mails);
+    await fetchAndSaveAttachments(auth, gmail, attachments);
+
+    spinner.succeed('All attachments downloaded successfully');
+  } catch (error) {
+    spinner.fail('An error occurred');
+    console.error('Error:', error);
+    process.exit(1);
+  }
 }
 
-const spinner = ora('Reading 1 page');
-AuthFetcher.getAuthAndGmail(main);
+async function defaultBehaviour(auth, gmail, coredata) {
+  const option = await askForFilter();
+
+  if (option === 'label') {
+    const response = await gmail.users.labels.list({ userId: 'me' });
+    const labels = response.data.labels;
+    const selectedLabel = await askForLabel(labels);
+    coredata.label = selectedLabel;
+
+    spinner.text = 'Fetching emails by label...';
+    return getListOfMailIdByLabel(auth, gmail, selectedLabel.id, 200);
+  }
+
+  if (option === 'from') {
+    const mailId = await askForMail();
+    spinner.text = 'Fetching emails from sender...';
+    return getListOfMailIdByFromId(auth, gmail, mailId, 50);
+  }
+
+  spinner.text = 'Fetching all emails...';
+  return getAllMails(auth, gmail, 500);
+}
+
+async function scanForLabelOption(auth, gmail) {
+  const [, , option, labelName] = process.argv;
+
+  if (option !== '--label' || !labelName) {
+    throw new Error('Expected --label LABEL_NAME option');
+  }
+
+  const response = await gmail.users.labels.list({ userId: 'me' });
+  const labelObj = response.data.labels.find(l => l.name === labelName);
+
+  if (!labelObj) {
+    throw new Error(`Label "${labelName}" not found`);
+  }
+
+  return getListOfMailIdByLabel(auth, gmail, labelObj.id, 200);
+}
+
+async function fetchAndSaveAttachments(auth, gmail, attachments) {
+  const results = [];
+  const batchSize = 100;
+  let processed = 0;
+
+  const validAttachments = attachments.filter(att => att.id);
+  const totalAttachments = validAttachments.length;
+
+  for (let i = 0; i < validAttachments.length; i += batchSize) {
+    const batch = validAttachments.slice(i, i + batchSize);
+    const batchResults = await Promise.all(
+      batch.map(att => fetchAndSaveAttachment(auth, gmail, att))
+    );
+
+    results.push(...batchResults);
+    processed += batch.length;
+    spinner.text = `Saved ${processed}/${totalAttachments} attachments`;
+  }
+
+  return results;
+}
+
+async function fetchAndSaveAttachment(auth, gmail, attachment) {
+  try {
+    const response = await gmail.users.messages.attachments.get({
+      auth,
+      userId: 'me',
+      messageId: attachment.mailId,
+      id: attachment.id
+    });
+
+    if (!response || !response.data) {
+      throw new Error('Empty response from Gmail API');
+    }
+
+    const data = response.data.data
+      .replace(/-/g, '+')
+      .replace(/_/g, '/');
+
+    const content = Buffer.from(data, 'base64');
+    const fileName = path.resolve(__dirname, 'files', attachment.name);
+    const finalFileName = await FileHelper.getAvailableFileName(fileName);
+
+    await FileHelper.saveFile(finalFileName, content);
+    return { success: true, fileName: finalFileName };
+  } catch (error) {
+    console.error(`Failed to save attachment ${attachment.name}:`, error);
+    return { success: false, fileName: attachment.name, error };
+  }
+}
 
 /**
  * Lists the labels in the user's account.
@@ -38,184 +156,6 @@ function listLabels(auth, gmail) {
       resolve(response);
     });
   })
-}
-
-function main(auth, gmailInstance) {
-  let labels;
-  let coredata = {};
-  let workflow;
-  gmail = gmailInstance;
-  if (detectCommandOptions()) {
-    workflow = scanForLabelOption;
-  } else {
-    workflow = defaultBehaviour;
-  }
-  workflow(auth, gmail, coredata)
-    .then((mailList) => {
-      coredata.mailList = mailList;
-      return fetchMailsByMailIds(auth, mailList);
-    })
-    .then((mails) => {
-
-      coredata.attachments = pluckAllAttachments(mails);
-      return fetchAndSaveAttachments(auth, coredata.attachments);
-    })
-    .then(() => {
-      spinner.stop()
-      console.log('Done');
-    })
-    .catch((e) => console.log(e));
-}
-
-const detectCommandOptions = () => process.argv.length > 2;
-
-const defaultBehaviour = (auth, gmail, coredata) => {
-  return askForFilter()
-    .then((option) => {
-      if (option === 'label') {
-        return listLabels(auth, gmail)
-          .then((response) => {
-            labels = response.data.labels;
-            return labels;
-          })
-          .then(askForLabel)
-          .then((selectedLabel) => {
-            coredata.label = selectedLabel;
-            spinner.start()
-            return getListOfMailIdByLabel(auth, coredata.label.id, 200);
-          });
-      } else if (option === 'from') {
-        return askForMail()
-          .then((mailId) => {
-            spinner.start()
-            return getListOfMailIdByFromId(auth, mailId, 50);
-          });
-      } else {
-        spinner.start()
-        return getAllMails(auth, 500)
-      }
-    });
-};
-
-const scanForLabelOption = (auth, gmail) => {
-  return new Promise((resolve, reject) => {
-    const paramsNumber = process.argv.length;
-    if (paramsNumber == 4) {
-      const optionName = process.argv[2];
-      if (optionName === '--label') {
-        resolve(process.argv[3]);
-      }
-    }
-    reject("WARNING: expected --label LABEL_NAME option")
-  })
-    .then(labelName => {
-      return listLabels(auth, gmail)
-        .then(response => {
-          const labelObj = _.find(response.data.labels, l => l.name === labelName);
-          return getListOfMailIdByLabel(auth, labelObj.id, 200);
-        });
-    });
-};
-
-async function fetchAndSaveAttachments(auth, attachments) {
-  let results = [];
-  let promises = [];
-  let counter = 0;
-  let processed = 0;
-  spinner.text = "Fetching attachment from mails"
-  for (index in attachments) {
-    if (attachments[index].id) {
-      promises.push(fetchAndSaveAttachment(auth, attachments[index]));
-      counter++;
-      processed++;
-      if (counter === 100) {
-        attachs = await Promise.all(promises);
-        _.merge(results, attachs);
-        promises = [];
-        counter = 0;
-        spinner.text = processed + " attachemets are saved"
-      }
-    }
-  }
-  attachs = await Promise.all(promises);
-  _.merge(results, attachs);
-  return results;
-}
-
-function fetchAndSaveAttachment(auth, attachment) {
-  return new Promise((resolve, reject) => {
-    gmail.users.messages.attachments.get({
-      auth: auth,
-      userId: 'me',
-      messageId: attachment.mailId,
-      id: attachment.id
-    }, function (err, response) {
-      if (err) {
-        console.log('The API returned an error: ' + err);
-        reject(err);
-      }
-      if (!response) {
-        console.log('Empty response: ' + response);
-        reject(response);
-      }
-      var data = response.data.data.replaceAll('-', '+');
-      data = data.replaceAll('_', '/');
-      var content = fixBase64(data);
-      resolve(content);
-    });
-  })
-    .then((content) => {
-      var fileName = path.resolve(__dirname, 'files', attachment.name);
-      return FileHelper.isFileExist(fileName)
-        .then((isExist) => {
-          if (isExist) {
-            return FileHelper.getNewFileName(fileName);
-          }
-          return fileName;
-        })
-        .then((availableFileName) => {
-          return FileHelper.saveFile(availableFileName, content);
-        })
-    })
-}
-
-
-function pluckAllAttachments(mails) {
-  return _.compact(_.flatten(_.map(mails, (m) => {
-    if (!m.data || !m.data.payload || !m.data.payload.parts) {
-      return undefined;
-    }
-    if (m.data.payload.mimeType === "multipart/signed") {
-      return _.flatten(_.map(m.data.payload.parts, (p) => {
-        if (p.mimeType !== "multipart/mixed") {
-          return undefined;
-        }
-        return _.map(p.parts, (pp) => {
-          if (!pp.body || !pp.body.attachmentId) {
-            return undefined;
-          }
-          const attachment = {
-            mailId: m.data.id,
-            name: pp.filename,
-            id: pp.body.attachmentId
-          };
-          return attachment;
-        })
-      }))
-    } else {
-      return _.map(m.data.payload.parts, (p) => {
-        if (!p.body || !p.body.attachmentId) {
-          return undefined;
-        }
-        const attachment = {
-          mailId: m.data.id,
-          name: p.filename,
-          id: p.body.attachmentId
-        };
-        return attachment;
-      })
-  }
-  })));
 }
 
 function askForLabel(labels) {
@@ -263,7 +203,7 @@ function askForMail() {
     .then(answers => answers.from);
 }
 
-function getListOfMailIdByLabel(auth, labelId, maxResults = 500, nextPageToken) {
+function getListOfMailIdByLabel(auth, gmail, labelId, maxResults = 500, nextPageToken) {
   return new Promise((resolve, reject) => {
     gmail.users.messages.list({
       auth: auth,
@@ -280,7 +220,7 @@ function getListOfMailIdByLabel(auth, labelId, maxResults = 500, nextPageToken) 
         messageIds = messageIds.concat(response.data.messages)
         if (response.data.nextPageToken) {
           spinner.text = "Reading page: " + ++pageCounter
-          resolve(getListOfMailIdByLabel(auth, labelId, maxResults, response.data.nextPageToken))
+          resolve(getListOfMailIdByLabel(auth, gmail, labelId, maxResults, response.data.nextPageToken))
         }
       }
       spinner.text = "All pages are read"
@@ -289,7 +229,7 @@ function getListOfMailIdByLabel(auth, labelId, maxResults = 500, nextPageToken) 
   });
 }
 
-function getAllMails(auth, maxResults = 500, nextPageToken) {
+function getAllMails(auth, gmail, maxResults = 500, nextPageToken) {
   return new Promise((resolve, reject) => {
     gmail.users.messages.list({
       auth: auth,
@@ -305,7 +245,7 @@ function getAllMails(auth, maxResults = 500, nextPageToken) {
         messageIds = messageIds.concat(response.data.messages)
         if (response.data.nextPageToken) {
           spinner.text = "Reading page: " + ++pageCounter
-          resolve(getAllMails(auth, maxResults, response.data.nextPageToken))
+          resolve(getAllMails(auth, gmail, maxResults, response.data.nextPageToken))
         }
       }
       spinner.text = "All pages are read"
@@ -314,7 +254,7 @@ function getAllMails(auth, maxResults = 500, nextPageToken) {
   });
 }
 
-function getListOfMailIdByFromId(auth, mailId, maxResults = 500) {
+function getListOfMailIdByFromId(auth, gmail, mailId, maxResults = 500) {
   return new Promise((resolve, reject) => {
     gmail.users.messages.list({
       auth: auth,
@@ -332,62 +272,97 @@ function getListOfMailIdByFromId(auth, mailId, maxResults = 500) {
 }
 
 async function fetchMailsByMailIds(auth, mailList) {
-  let results = [];
-  let promises = [];
-  let counter = 0;
+  const results = [];
+  const batchSize = 100;
+  const delay = 3000; // 3 seconds delay between batches
   let processed = 0;
-  spinner.text = "Fetching each mail"
-  for (index in mailList) {
-    if (mailList[index]) {
-      promises.push(getMail(auth, mailList[index].id));
-      counter++;
-      processed++;
-      if (counter === 100) {
-        mails = await Promise.all(promises);
-        results = results.concat(mails)
-        promises = [];
-        counter = 0;
-        spinner.text = processed + " mails fetched"
-        await sleep(3000)
+
+  spinner.text = "Fetching emails...";
+
+  try {
+    // Process emails in batches
+    for (let i = 0; i < mailList.length; i += batchSize) {
+      const batch = mailList.slice(i, Math.min(i + batchSize, mailList.length));
+      const validBatch = batch.filter(mail => mail && mail.id);
+
+      if (validBatch.length > 0) {
+        const batchPromises = validBatch.map(mail => getMail(auth, mail.id));
+        const batchMails = await Promise.all(batchPromises);
+        results.push(...batchMails);
+
+        processed += validBatch.length;
+        spinner.text = `Fetched ${processed}/${mailList.length} emails`;
+
+        // Add delay between batches to avoid rate limiting
+        if (i + batchSize < mailList.length) {
+          spinner.text = `Waiting ${delay / 1000}s before next batch...`;
+          await sleep(delay);
+        }
       }
     }
-  };
-  mails = await Promise.all(promises);
-  results = results.concat(mails)
-  return results;
+
+    return results;
+  } catch (error) {
+    spinner.fail(`Error fetching emails: ${error.message}`);
+    throw error;
+  }
 }
 
 function sleep(ms) {
-  spinner.text = `sleeping for ${ms/1000} s`
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function getMail(auth, mailId) {
-  return new Promise((resolve, reject) => {
-    gmail.users.messages.get({
+async function getMail(auth, mailId) {
+  try {
+    const response = await gmail.users.messages.get({
       userId: 'me',
       id: mailId,
       auth,
-    }, (err, response) => {
-      if (err) {
-        reject(err);
-      }
-      resolve(response);
-    })
-  })
-}
-
-function fixBase64(binaryData) {
-  const base64str = binaryData// base64 string from  thr response of server
-  const binary = atob(base64str.replace(/\s/g, ''));// decode base64 string, remove space for IE compatibility
-  const len = binary.length;         // get binary length
-  const buffer = new ArrayBuffer(len);         // create ArrayBuffer with binary length
-  const view = new Uint8Array(buffer);         // create 8-bit Array
-
-  // save unicode of binary data into 8-bit Array
-  for (let i = 0; i < len; i++) {
-    view[i] = binary.charCodeAt(i);
+    });
+    return response;
+  } catch (error) {
+    console.error(`Failed to fetch email ${mailId}:`, error.message);
+    return null;
   }
-
-  return view;
 }
+
+function pluckAllAttachments(mails) {
+  return _.compact(_.flatten(_.map(mails, (m) => {
+    if (!m.data || !m.data.payload || !m.data.payload.parts) {
+      return undefined;
+    }
+    if (m.data.payload.mimeType === "multipart/signed") {
+      return _.flatten(_.map(m.data.payload.parts, (p) => {
+        if (p.mimeType !== "multipart/mixed") {
+          return undefined;
+        }
+        return _.map(p.parts, (pp) => {
+          if (!pp.body || !pp.body.attachmentId) {
+            return undefined;
+          }
+          const attachment = {
+            mailId: m.data.id,
+            name: pp.filename,
+            id: pp.body.attachmentId
+          };
+          return attachment;
+        })
+      }))
+    } else {
+      return _.map(m.data.payload.parts, (p) => {
+        if (!p.body || !p.body.attachmentId) {
+          return undefined;
+        }
+        const attachment = {
+          mailId: m.data.id,
+          name: p.filename,
+          id: p.body.attachmentId
+        };
+        return attachment;
+      })
+    }
+  })));
+}
+
+// Start the application
+main().catch(console.error);

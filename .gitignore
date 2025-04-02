@@ -59,3 +59,6 @@ typings/
 /files/*.*
 token.json
 credentials.json
+
+files/*
+decrypted/*
